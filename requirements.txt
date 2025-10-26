@@ -1,0 +1,4 @@
+asyncpg>=0.30.0
+pydantic>=2.12.3
+pydantic-settings>=2.11.0
+aio-pika>=2.2.0
