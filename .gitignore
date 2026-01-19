@@ -10,6 +10,9 @@ __pycache__/
 .env
 .env.local
 
+# Runtime state files
+axis_state.json
+
 # Github files
 .github/
 
