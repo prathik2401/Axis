@@ -1,54 +1,58 @@
 import os
-from typing import List, Optional
-from utils.logging import get_logger
-from pydantic_settings import BaseSettings
-
-logger = get_logger(__name__)
+from typing import List, Optional, Union
+from pydantic import Field, field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
-    
-    # PostgreSQL connection settings
-    pg_dsn: str = os.getenv("PG_DSN", "")
-    if not pg_dsn:
-        raise ValueError("PG_DSN environment variable is required")
 
-    logger.debug(f"PostgreSQL DSN is configured")
-    pg_channel: str = os.getenv("PG_CHANNEL", "axis_channel")
-    logger.debug(f"PostgreSQL channel is set to: {pg_channel}")
+    model_config = SettingsConfigDict(
+        env_file=".env", env_file_encoding="utf-8", extra="ignore"
+    )
+
+    # PostgreSQL connection settings
+    pg_dsn: str = Field(..., description="PostgreSQL connection DSN")
+    pg_channel: str = Field(
+        default="axis_channel", description="PostgreSQL NOTIFY channel"
+    )
 
     # RabbitMQ connection settings
-    rmq_url: str = os.getenv("RMQ_URL", "")
-    if not rmq_url:
-        raise ValueError("RMQ_URL environment variable is required")
-    logger.debug(f"RabbitMQ URL is configured")
-    rmq_exchange: str = os.getenv("RMQ_EXCHANGE", "axis_exchange")
-    logger.debug(f"RabbitMQ exchange is set to: {rmq_exchange}")
-    rmq_exchange_type: str = "fanout"
-
-    # Replication settings
-    tables_to_replicate: List[str] = (
-        os.getenv("TABLES_TO_REPLICATE", "*").split(",")
+    rmq_url: str = Field(..., description="RabbitMQ connection URL")
+    rmq_exchange: str = Field(
+        default="axis_exchange", description="RabbitMQ exchange name"
     )
-    logger.debug(f"Tables to replicate: {tables_to_replicate}")
-    
+    rmq_exchange_type: str = Field(
+        default="fanout", description="RabbitMQ exchange type"
+    )
+
+    # Replication settings - use Union to accept both string and list
+    tables_to_replicate: Union[str, List[str]] = Field(
+        default="*", description="Tables to replicate"
+    )
     # Batch settings
-    batch_size: int = int(os.getenv("BATCH_SIZE", "10"))
-    batch_timeout_seconds: float = float(os.getenv("BATCH_TIMEOUT", "5.0"))
-    
+    batch_size: int = Field(default=10, description="Batch size for operations")
+    batch_timeout_seconds: float = Field(
+        default=5.0, alias="batch_timeout", description="Batch timeout in seconds"
+    )
+
     # Queue settings
-    max_queue_size: int = int(os.getenv("MAX_QUEUE_SIZE", "10000"))
-    prefetch_count: int = int(os.getenv("PREFETCH_COUNT", "10"))
-    
+    max_queue_size: int = Field(default=10000, description="Maximum queue size")
+    prefetch_count: int = Field(default=10, description="RabbitMQ prefetch count")
+
     # State persistence
-    state_file: str = os.getenv("STATE_FILE", "./axis_state.json")
-    
+    state_file: str = Field(
+        default="./axis_state.json", description="State persistence file"
+    )
+
     # App metadata
-    app_name: str = "Axis"
-    app_version: str = "0.1.0"
+    app_name: str = Field(default="Axis", description="Application name")
+    app_version: str = Field(default="0.1.0", description="Application version")
 
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
-
+    @field_validator("tables_to_replicate", mode="before")
+    @classmethod
+    def parse_tables(cls, v):
+        """Parse comma-separated table names."""
+        if isinstance(v, str):
+            return [t.strip() for t in v.split(",") if t.strip()]
+        return v
