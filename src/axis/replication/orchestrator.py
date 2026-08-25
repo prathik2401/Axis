@@ -128,12 +128,13 @@ class ReplicationOrchestrator:
             logger.info("Started RabbitMQ publisher")
             self.metrics.update_component_health("rabbitmq", True)
             
-            # Start replica consumers
+            # Start replica consumers (queue names include exchange so multiple
+            # Axis instances / source DBs do not share a competing consumer queue)
             for i, replica_config in enumerate(self.replica_configs):
                 consumer = PostgresReplayConsumer(
                     rabbitmq_url=self.rabbitmq_url,
                     exchange_name=self.exchange_name,
-                    queue_name=f"axis_replica_{i}",
+                    queue_name=f"{self.exchange_name}_replica_{i}",
                     replica_db_config=replica_config,
                     state_store=self.state_store,
                     batch_size=10,

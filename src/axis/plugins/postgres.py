@@ -1,11 +1,41 @@
 import asyncpg
 import json
 from typing import Any, Dict, List, Optional, AsyncIterator
-from datetime import datetime
+from datetime import date, datetime
+from decimal import Decimal, InvalidOperation
 from .base import DatabasePlugin, DatabaseConfig, ChangeEvent, ReplicationMetadata
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+def _coerce_pg_value(value: Any) -> Any:
+    """Coerce JSON-decoded values into types asyncpg accepts for PG columns."""
+    if value is None or isinstance(value, (bool, int, float, bytes, Decimal)):
+        return value
+    if isinstance(value, (datetime, date)):
+        return value
+    if isinstance(value, str):
+        # ISO timestamps from row_to_json / JSON transport
+        if len(value) >= 10 and value[4] == "-" and value[7] == "-":
+            try:
+                return datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                pass
+        # Numeric strings (rare, but safe for decimal columns)
+        try:
+            if "." in value or "e" in value.lower():
+                return Decimal(value)
+        except (InvalidOperation, ValueError):
+            pass
+        return value
+    return value
+
+
+def _coerce_row(row: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if row is None:
+        return None
+    return {k: _coerce_pg_value(v) for k, v in row.items()}
 
 
 class PostgresPlugin(DatabasePlugin):
@@ -83,7 +113,7 @@ class PostgresPlugin(DatabasePlugin):
                 BEGIN
                     IF (TG_OP = 'DELETE') THEN
                         data := row_to_json(OLD)::JSONB;
-                        old_data := NULL;
+                        old_data := row_to_json(OLD)::JSONB;
                     ELSIF (TG_OP = 'UPDATE') THEN
                         data := row_to_json(NEW)::JSONB;
                         old_data := row_to_json(OLD)::JSONB;
@@ -190,12 +220,16 @@ class PostgresPlugin(DatabasePlugin):
         Returns:
             True if successful
         """
+        payload = _coerce_row(event.payload) or {}
+        old_values = _coerce_row(event.old_values)
+        primary_key = _coerce_row(event.primary_key)
+
         async with self._pool.acquire() as conn:
             try:
                 if event.operation == "INSERT":
                     # Build INSERT statement
-                    columns = list(event.payload.keys())
-                    values = [event.payload[col] for col in columns]
+                    columns = list(payload.keys())
+                    values = [payload[col] for col in columns]
                     placeholders = ", ".join(f"${i+1}" for i in range(len(columns)))
 
                     query = f"""
@@ -206,33 +240,30 @@ class PostgresPlugin(DatabasePlugin):
                     await conn.execute(query, *values)
 
                 elif event.operation == "UPDATE":
-                    # Build UPDATE statement
+                    # Prefer primary key; otherwise identify by id if present;
+                    # finally fall back to full old row match.
                     set_clause = ", ".join(
-                        f"{col} = ${i+1}" for i, col in enumerate(event.payload.keys())
+                        f"{col} = ${i+1}" for i, col in enumerate(payload.keys())
                     )
+                    identity = primary_key
+                    if not identity and old_values and "id" in old_values:
+                        identity = {"id": old_values["id"]}
+                    elif not identity and "id" in payload:
+                        identity = {"id": payload["id"]}
+                    elif not identity and old_values:
+                        identity = old_values
 
-                    # Use old_values to identify the row
-                    if event.primary_key:
-                        where_clause = " AND ".join(
-                            f"{k} = ${len(event.payload) + i + 1}"
-                            for i, k in enumerate(event.primary_key.keys())
+                    if not identity:
+                        logger.error(
+                            "Cannot update without primary_key, id, or old_values"
                         )
-                        values = list(event.payload.values()) + list(
-                            event.primary_key.values()
-                        )
-                    elif event.old_values:
-                        # Fallback: use all old values
-                        where_clause = " AND ".join(
-                            f"{k} = ${len(event.payload) + i + 1}"
-                            for i, k in enumerate(event.old_values.keys())
-                        )
-                        values = list(event.payload.values()) + list(
-                            event.old_values.values()
-                        )
-                    else:
-                        # No way to identify the row
-                        logger.error(f"Cannot update without primary_key or old_values")
                         return False
+
+                    where_clause = " AND ".join(
+                        f"{k} = ${len(payload) + i + 1}"
+                        for i, k in enumerate(identity.keys())
+                    )
+                    values = list(payload.values()) + list(identity.values())
 
                     query = f"""
                         UPDATE {event.table}
@@ -242,15 +273,20 @@ class PostgresPlugin(DatabasePlugin):
                     await conn.execute(query, *values)
 
                 elif event.operation == "DELETE":
-                    if not event.old_values:
-                        logger.error(f"Cannot delete without old_values")
+                    # Trigger stores deleted row in payload and old_values;
+                    # accept either for robustness across event versions.
+                    identity = primary_key or old_values or payload
+                    if not identity:
+                        logger.error("Cannot delete without row identity values")
                         return False
-                        
-                    # Build DELETE statement
+
+                    if "id" in identity and not primary_key:
+                        identity = {"id": identity["id"]}
+
                     where_clause = " AND ".join(
-                        f"{k} = ${i+1}" for i, k in enumerate(event.old_values.keys())
+                        f"{k} = ${i+1}" for i, k in enumerate(identity.keys())
                     )
-                    values = list(event.old_values.values())
+                    values = list(identity.values())
 
                     query = f"""
                         DELETE FROM {event.table}
